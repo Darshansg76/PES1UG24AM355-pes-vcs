@@ -15,6 +15,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "index.h"
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -23,6 +24,8 @@
 #define MODE_DIR       0040000
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // Determine the object mode for a filesystem path.
 uint32_t get_file_mode(const char *path) {
@@ -129,9 +132,87 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int build_tree(Index *index, const char *prefix, ObjectID *out_id) {
+    Tree tree;
+    tree.count = 0;
+
+    int prefix_len = strlen(prefix);
+
+    for (int i = 0; i < index->count; i++) {
+        const char *path = index->entries[i].path;
+
+        // Check if this entry belongs to current directory level
+        if (prefix_len > 0) {
+            if (strncmp(path, prefix, prefix_len) != 0 || path[prefix_len] != '/')
+                continue;
+            path += prefix_len + 1;
+        }
+
+        // Check if it's a direct file or deeper path
+        char *slash = strchr(path, '/');
+
+        if (!slash) {
+            // Direct file
+            TreeEntry *e = &tree.entries[tree.count++];
+
+            e->mode = index->entries[i].mode;
+            e->hash = index->entries[i].hash;
+            strcpy(e->name, path);
+        } else {
+            // Subdirectory
+            char dirname[256];
+            int len = slash - path;
+            strncpy(dirname, path, len);
+            dirname[len] = '\0';
+
+            // Check if already added
+            int exists = 0;
+            for (int j = 0; j < tree.count; j++) {
+                if (strcmp(tree.entries[j].name, dirname) == 0) {
+                    exists = 1;
+                    break;
+                }
+            }
+
+            if (!exists) {
+                ObjectID sub_id;
+
+                char new_prefix[512];
+                if (prefix_len == 0)
+                    snprintf(new_prefix, sizeof(new_prefix), "%s", dirname);
+                else
+                    snprintf(new_prefix, sizeof(new_prefix), "%s/%s", prefix, dirname);
+
+                if (build_tree(index, new_prefix, &sub_id) != 0)
+                    return -1;
+
+                TreeEntry *e = &tree.entries[tree.count++];
+                e->mode = MODE_DIR;
+                e->hash = sub_id;
+                strcpy(e->name, dirname);
+            }
+        }
+    }
+
+    void *data;
+    size_t len;
+
+    if (tree_serialize(&tree, &data, &len) != 0)
+        return -1;
+
+    if (object_write(OBJ_TREE, data, len, out_id) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+    return 0;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+    if (index_load(&index) != 0)
+        return -1;
+
+    return build_tree(&index, "", id_out);
 }
